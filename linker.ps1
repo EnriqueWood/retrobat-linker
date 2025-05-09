@@ -1,17 +1,14 @@
-param (
-    [string]$DriveLetter,
-    [string]$UNCPath,
-    [string]$Type,
-    [string]$Suffix,
-    [string]$Platform,
-    [switch]$ShowSkips
-)
+param ([string]$DriveLetter, [string]$UNCPath, [string]$Type, [string]$Suffix, [string]$Platform, [switch]$ShowSkips, [switch]$AddSuffix)
 
 $LogDir = "C:\RetroBat\logs"
 if (-not (Test-Path -LiteralPath $LogDir)) {
     New-Item -Path $LogDir -ItemType Directory | Out-Null
 }
-$Log = if ($Platform) { "$LogDir\link_script_$Platform.log" } else { "$LogDir\link_script_main.log" }
+$Log = if ($Platform) {
+    "$LogDir\link_script_$Platform.log"
+} else {
+    "$LogDir\link_script_main.log"
+}
 
 $RetroBatRoms = "C:\RetroBat\roms"
 $SkipCount = 0
@@ -28,14 +25,9 @@ function LogSkip($path) {
     $global:PlatformSkipCount++
 }
 
-function Escape-RegexLiteral {
-    param ([string]$Text)
-    return [Regex]::Escape($Text)
-}
-
 function Load-Gamelists {
     param ([string[]]$Paths)
-    $docs = @{}
+    $docs = @{ }
     foreach ($path in $Paths) {
         if (Test-Path $path) {
             try {
@@ -52,13 +44,7 @@ function Load-Gamelists {
 }
 
 function Clone-GamelistEntry {
-    param (
-        [hashtable]$XmlDocs,
-        [string]$OriginalRomName,
-        [string]$NewRomName,
-        [string]$Suffix
-    )
-
+    param ([hashtable]$XmlDocs, [string]$OriginalRomName, [string]$NewRomName, [string]$Suffix)
     $originalPath = "./$OriginalRomName"
     $newPath = "./$NewRomName"
     $targetBase = $newPath -replace '^\.\/', '' -replace '\.[^\.]+$', ''
@@ -72,32 +58,32 @@ function Clone-GamelistEntry {
         if ($matchingGame) {
             $clone = $matchingGame.Clone()
             $clone.path = $newPath
-            if ($clone.name) { $clone.name = "$($clone.name)[$Suffix]" }
-            if ($clone.sortname) { $clone.sortname = "$($clone.sortname)[$Suffix]" }
+            if ($clone.name) {
+                $clone.name = "$( $clone.name )[$Suffix]"
+            }
+            if ($clone.sortname) {
+                $clone.sortname = "$( $clone.sortname )[$Suffix]"
+            }
 
-            foreach ($tag in @("image","video","marquee","cartridge","boxart","wheel","mix","screenshot")) {
+            foreach ($tag in @("image", "video", "marquee", "cartridge", "boxart", "wheel", "mix", "screenshot")) {
                 if ($clone.$tag) {
                     $clone.$tag = $clone.$tag -replace [regex]::Escape($originalBase), $targetBase
                 }
             }
 
             $xml.gameList.AppendChild($xml.ImportNode($clone, $true)) | Out-Null
-            Log "Cloned entry in $([System.IO.Path]::GetFileName($path)) for: $NewRomName"
+            Log "Cloned entry in $([System.IO.Path]::GetFileName($path) ) for: $NewRomName"
         }
     }
 }
 
 function Create-Symlink {
-    param (
-        [string]$TargetPath,
-        [string]$SourcePath
-    )
+    param ([string]$TargetPath, [string]$SourcePath)
     try {
         if (Test-Path -LiteralPath $TargetPath) {
             LogSkip $TargetPath
             return
         }
-
         New-Item -Path $TargetPath -ItemType SymbolicLink -Value $SourcePath -ErrorAction Stop | Out-Null
         Log "Linked: `"$TargetPath`""
     } catch {
@@ -105,28 +91,37 @@ function Create-Symlink {
     }
 }
 
-# PHASE 1: Normal user session - elevation
+# PHASE 1: elevation & relaunch
 if (-not $UNCPath) {
     try {
         $drive = Get-PSDrive -Name $DriveLetter
         $UNCPath = $drive.DisplayRoot
-
         if (-not $UNCPath -or -not ($UNCPath -match "\\\\([^\\]+)\\([^\\]+)")) {
             throw "Could not resolve UNC path for $DriveLetter"
         }
-
         $NetworkHost = $Matches[1]
         $Share = $Matches[2]
         $Type = $Share.Split()[0].ToUpper()
-        $Suffix = if ($NetworkHost -match "^\d{1,3}(\.\d{1,3}){3}$") { "LAN" } else { "TS" }
+        $Suffix = if ($NetworkHost -match "^\d{1,3}(\.\d{1,3}){3}$") {
+            "LAN"
+        } else {
+            "TS"
+        }
 
         Log "Detected drive: $DriveLetter => $UNCPath (host: $NetworkHost)"
         Log "Type: $Type, Suffix: $Suffix"
         $confirm = Read-Host "Proceed with type [$Type] and suffix [$Suffix]? (y/n)"
-        if ($confirm -ne "y") { Log "Aborted by user."; exit }
+        if ($confirm -ne "y") {
+            Log "Aborted by user."; exit
+        }
 
         $args = "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -DriveLetter $DriveLetter -UNCPath `"$UNCPath`" -Type $Type -Suffix $Suffix"
-        if ($ShowSkips) { $args += " -ShowSkips" }
+        if ($AddSuffix) {
+            $args += " -AddSuffix"
+        }
+        if ($ShowSkips) {
+            $args += " -ShowSkips"
+        }
         Start-Process powershell -Verb RunAs -ArgumentList $args
         exit
     } catch {
@@ -136,23 +131,22 @@ if (-not $UNCPath) {
 }
 
 $Drive = "${DriveLetter}:"
-
-# Only the elevated main process maps the drive
 if (-not $Platform) {
     if ((net use | Select-String "${DriveLetter}:")) {
         cmd /c "net use ${DriveLetter}: /delete" > $null 2>&1
         Start-Sleep -Milliseconds 500
     }
     cmd /c "net use ${DriveLetter}: `"$UNCPath`"" > $null 2>&1
-}
-
-# Launch parallel processes if no platform is passed
-if (-not $Platform) {
     Log "Launching per-platform processes..."
     Get-ChildItem -LiteralPath $Drive -Directory | ForEach-Object {
         $PlatformName = $_.Name
         $argStr = "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -DriveLetter $DriveLetter -UNCPath `"$UNCPath`" -Type $Type -Suffix $Suffix -Platform `"$PlatformName`""
-        if ($ShowSkips) { $argStr += " -ShowSkips" }
+        if ($AddSuffix) {
+            $argStr += " -AddSuffix"
+        }
+        if ($ShowSkips) {
+            $argStr += " -ShowSkips"
+        }
         Start-Process powershell -ArgumentList $argStr
         Log "Started process for platform: $PlatformName"
     }
@@ -160,7 +154,7 @@ if (-not $Platform) {
     exit
 }
 
-# PLATFORM-SPECIFIC BLOCK BELOW
+# PLATFORM-SPECIFIC BLOCK
 Log "Processing platform: $Platform"
 $SourcePlatformPath = Join-Path $Drive $Platform
 $TargetPlatformPath = Join-Path $RetroBatRoms $Platform
@@ -168,19 +162,7 @@ $TargetPlatformPath = Join-Path $RetroBatRoms $Platform
 if (!(Test-Path -LiteralPath $RetroBatRoms)) {
     Log "Creating $RetroBatRoms"
     New-Item -Path $RetroBatRoms -ItemType Directory | Out-Null
-} elseif ((Get-Item -LiteralPath $RetroBatRoms).Attributes -match "ReparsePoint") {
-    Log "Recreating $RetroBatRoms"
-    Remove-Item -LiteralPath $RetroBatRoms -Force
-    New-Item -Path $RetroBatRoms -ItemType Directory | Out-Null
 }
-
-if (Test-Path -LiteralPath $TargetPlatformPath) {
-    if ((Get-Item -LiteralPath $TargetPlatformPath).Attributes -match "ReparsePoint") {
-        Log "Removing old symlink: $TargetPlatformPath"
-        Remove-Item -LiteralPath $TargetPlatformPath -Force
-    }
-}
-
 if (-not (Test-Path -LiteralPath $TargetPlatformPath)) {
     Log "Creating folder: $TargetPlatformPath"
     New-Item -Path $TargetPlatformPath -ItemType Directory | Out-Null
@@ -207,16 +189,23 @@ Get-ChildItem -LiteralPath $SourcePlatformPath -File | Where-Object {
     $OriginalFile = $_.Name
     $OriginalFilePath = $_.FullName
     $BaseName = $_.BaseName
-    $NewFileName = "{0}[{1}]{2}" -f $BaseName, $Suffix, $_.Extension
+    $NewFileName = if ($AddSuffix) {
+        "{0}[{1}]{2}" -f $BaseName, $Suffix, $_.Extension
+    } else {
+        $_.Name
+    }
     $LinkPath = Join-Path $TargetPlatformPath $NewFileName
 
     Create-Symlink -TargetPath $LinkPath -SourcePath $OriginalFilePath
     $RenamedMap[$BaseName] = $NewFileName
-
-    Clone-GamelistEntry -XmlDocs $LoadedGamelists -OriginalRomName $OriginalFile -NewRomName $NewFileName -Suffix $Suffix
+    if ($AddSuffix) {
+        Clone-GamelistEntry -XmlDocs $LoadedGamelists -OriginalRomName $OriginalFile -NewRomName $NewFileName -Suffix $Suffix
+    }
 }
 
-foreach ($folderName in @("downloaded_images", "images", "manuals", "videos")) {
+# ASSET LINKING BLOCK
+$AssetFolders = @("downloaded_images", "images", "manuals", "videos")
+foreach ($folderName in $AssetFolders) {
     $srcFolder = Join-Path $SourcePlatformPath $folderName
     $dstFolder = Join-Path $TargetPlatformPath $folderName
 
@@ -226,34 +215,44 @@ foreach ($folderName in @("downloaded_images", "images", "manuals", "videos")) {
             New-Item -Path $dstFolder -ItemType Directory | Out-Null
         }
 
-        foreach ($baseName in $RenamedMap.Keys) {
-            $newBase = $RenamedMap[$baseName] -replace '\.[^.]+$', ''
-            $expectedPrefix = "$baseName"
-            $expectedPrefixLength = $expectedPrefix.Length
+        if ($AddSuffix) {
+            foreach ($baseName in $RenamedMap.Keys) {
+                $newBase = $RenamedMap[$baseName] -replace '\.[^.]+$', ''
+                $expectedPrefix = "$baseName"
+                $expectedPrefixLength = $expectedPrefix.Length
 
-            Get-ChildItem -LiteralPath $srcFolder -File | ForEach-Object {
-                $Asset = $_
-                if (
-                $Asset.BaseName.Length -gt $expectedPrefixLength -and
-                        $Asset.BaseName.Substring(0, $expectedPrefixLength) -eq $expectedPrefix -and
-                        ($Asset.BaseName[$expectedPrefixLength] -match '[^a-zA-Z0-9]')
-                ) {
-                    $AssetSuffix = $Asset.Name.Substring($expectedPrefixLength)
-                    $TargetAssetName = "$newBase$AssetSuffix"
-                    $dstLink = Join-Path $dstFolder $TargetAssetName
-                    Create-Symlink -TargetPath $dstLink -SourcePath $Asset.FullName
+                Get-ChildItem -LiteralPath $srcFolder -File | ForEach-Object {
+                    $Asset = $_
+                    if ($Asset.BaseName.Length -gt $expectedPrefixLength -and $Asset.BaseName.Substring(0, $expectedPrefixLength) -eq $expectedPrefix -and ($Asset.BaseName[$expectedPrefixLength] -match '[^a-zA-Z0-9]')) {
+                        $AssetSuffix = $Asset.Name.Substring($expectedPrefixLength)
+                        $TargetAssetName = "$newBase$AssetSuffix"
+                        $dstLink = Join-Path $dstFolder $TargetAssetName
+                        Create-Symlink -TargetPath $dstLink -SourcePath $Asset.FullName
+                    }
                 }
+            }
+        } else {
+            Get-ChildItem -Path $srcFolder -Recurse -File | ForEach-Object {
+                $relativePath = $_.FullName.Substring($srcFolder.Length).TrimStart('\\')
+                $targetPath = Join-Path $dstFolder $relativePath
+                $targetDir = Split-Path $targetPath
+                if (-not (Test-Path $targetDir)) {
+                    New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+                }
+                Create-Symlink -TargetPath $targetPath -SourcePath $_.FullName
             }
         }
     }
 }
 
-foreach ($path in $LoadedGamelists.Keys) {
-    try {
-        $LoadedGamelists[$path].Save($path)
-        Log "Saved updated gamelist: $([System.IO.Path]::GetFileName($path))"
-    } catch {
-        Log "Failed to save gamelist: $path — $_"
+if ($AddSuffix) {
+    foreach ($path in $LoadedGamelists.Keys) {
+        try {
+            $LoadedGamelists[$path].Save($path)
+            Log "Saved updated gamelist: $([System.IO.Path]::GetFileName($path) )"
+        } catch {
+            Log "Failed to save gamelist: $path — $_"
+        }
     }
 }
 
