@@ -3,11 +3,19 @@ param (
     [string]$UNCPath,
     [string]$Type,
     [string]$Suffix,
+    [string]$Platform,
     [switch]$ShowSkips
 )
 
+$LogDir = "C:\RetroBat\logs"
+if (-not (Test-Path -LiteralPath $LogDir)) {
+    New-Item -Path $LogDir -ItemType Directory | Out-Null
+}
+$Log = if ($Platform) { "$LogDir\link_script_$Platform.log" } else { "$LogDir\link_script_main.log" }
+
 $RetroBatRoms = "C:\RetroBat\roms"
-$Log = "C:\RetroBat\link_script.log"
+$SkipCount = 0
+$PlatformSkipCount = 0
 
 function Log($msg) {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -15,17 +23,14 @@ function Log($msg) {
     Write-Host $msg
 }
 
-function Escape-RegexLiteral {
-    param ([string]$Text)
-    return [Regex]::Escape($Text)
-}
-
-$SkipCount = 0
-$PlatformSkipCount = 0
-
 function LogSkip($path) {
     $global:SkipCount++
     $global:PlatformSkipCount++
+}
+
+function Escape-RegexLiteral {
+    param ([string]$Text)
+    return [Regex]::Escape($Text)
 }
 
 function Load-Gamelists {
@@ -39,7 +44,7 @@ function Load-Gamelists {
                 $doc.LoadXml($content)
                 $docs[$path] = $doc
             } catch {
-                Log "Failed to load XML file: $path ? $_"
+                Log "Failed to load XML file: $path — $_"
             }
         }
     }
@@ -96,11 +101,11 @@ function Create-Symlink {
         New-Item -Path $TargetPath -ItemType SymbolicLink -Value $SourcePath -ErrorAction Stop | Out-Null
         Log "Linked: `"$TargetPath`""
     } catch {
-        Log "Failed to link: $TargetPath ? $_"
+        Log "Failed to link: $TargetPath — $_"
     }
 }
 
-# PHASE 1: Non-elevated session
+# PHASE 1: Normal user session - elevation
 if (-not $UNCPath) {
     try {
         $drive = Get-PSDrive -Name $DriveLetter
@@ -130,15 +135,35 @@ if (-not $UNCPath) {
     }
 }
 
-Log "Running with elevation. Mapping ${DriveLetter}: to $UNCPath"
-cmd /c "net use ${DriveLetter}: /delete /yes" | Out-Null
-cmd /c "net use ${DriveLetter}: `"$UNCPath`"" | Out-Null
 $Drive = "${DriveLetter}:"
 
-if ($Type -ne "ROMS") {
-    Log "Only ROMS type is currently implemented. Exiting."
+# Only the elevated main process maps the drive
+if (-not $Platform) {
+    if ((net use | Select-String "${DriveLetter}:")) {
+        cmd /c "net use ${DriveLetter}: /delete" > $null 2>&1
+        Start-Sleep -Milliseconds 500
+    }
+    cmd /c "net use ${DriveLetter}: `"$UNCPath`"" > $null 2>&1
+}
+
+# Launch parallel processes if no platform is passed
+if (-not $Platform) {
+    Log "Launching per-platform processes..."
+    Get-ChildItem -LiteralPath $Drive -Directory | ForEach-Object {
+        $PlatformName = $_.Name
+        $argStr = "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -DriveLetter $DriveLetter -UNCPath `"$UNCPath`" -Type $Type -Suffix $Suffix -Platform `"$PlatformName`""
+        if ($ShowSkips) { $argStr += " -ShowSkips" }
+        Start-Process powershell -ArgumentList $argStr
+        Log "Started process for platform: $PlatformName"
+    }
+    Log "All platform jobs launched. Exiting main."
     exit
 }
+
+# PLATFORM-SPECIFIC BLOCK BELOW
+Log "Processing platform: $Platform"
+$SourcePlatformPath = Join-Path $Drive $Platform
+$TargetPlatformPath = Join-Path $RetroBatRoms $Platform
 
 if (!(Test-Path -LiteralPath $RetroBatRoms)) {
     Log "Creating $RetroBatRoms"
@@ -149,77 +174,69 @@ if (!(Test-Path -LiteralPath $RetroBatRoms)) {
     New-Item -Path $RetroBatRoms -ItemType Directory | Out-Null
 }
 
-Get-ChildItem -LiteralPath $Drive -Directory | ForEach-Object {
-    $global:PlatformSkipCount = 0
-    $Platform = $_.Name
-    Log "Scanning folder: $Platform"
+if (Test-Path -LiteralPath $TargetPlatformPath) {
+    if ((Get-Item -LiteralPath $TargetPlatformPath).Attributes -match "ReparsePoint") {
+        Log "Removing old symlink: $TargetPlatformPath"
+        Remove-Item -LiteralPath $TargetPlatformPath -Force
+    }
+}
 
-    $SourcePlatformPath = Join-Path $Drive $Platform
-    $TargetPlatformPath = Join-Path $RetroBatRoms $Platform
-    $GamelistFiles = @("gamelist.xml", "gamelist_ARRM.xml", "gamelist_tempo_old.xml")
-    $SourceGamelistFiles = $GamelistFiles | ForEach-Object { Join-Path $SourcePlatformPath $_ }
-    $TargetGamelistFiles = $GamelistFiles | ForEach-Object { Join-Path $TargetPlatformPath $_ }
+if (-not (Test-Path -LiteralPath $TargetPlatformPath)) {
+    Log "Creating folder: $TargetPlatformPath"
+    New-Item -Path $TargetPlatformPath -ItemType Directory | Out-Null
+}
 
-    if (Test-Path -LiteralPath $TargetPlatformPath) {
-        if ((Get-Item -LiteralPath $TargetPlatformPath).Attributes -match "ReparsePoint") {
-            Log "Removing old symlink: $TargetPlatformPath"
-            Remove-Item -LiteralPath $TargetPlatformPath -Force
+$GamelistFiles = @("gamelist.xml", "gamelist_ARRM.xml", "gamelist_tempo_old.xml")
+$SourceGamelistFiles = $GamelistFiles | ForEach-Object { Join-Path $SourcePlatformPath $_ }
+$TargetGamelistFiles = $GamelistFiles | ForEach-Object { Join-Path $TargetPlatformPath $_ }
+
+for ($i = 0; $i -lt $SourceGamelistFiles.Count; $i++) {
+    if ((Test-Path -LiteralPath $SourceGamelistFiles[$i]) -and (-not (Test-Path -LiteralPath $TargetGamelistFiles[$i]))) {
+        Copy-Item -LiteralPath $SourceGamelistFiles[$i] -Destination $TargetGamelistFiles[$i]
+        Log "Copied $($GamelistFiles[$i]) to: $TargetPlatformPath"
+    }
+}
+
+$LoadedGamelists = Load-Gamelists -Paths $TargetGamelistFiles
+$ExcludedFiles = @("gamelist.xml", "gamelist_ARRM.xml", "gamelist_tempo_old.xml", ".DS_Store", "._.DS_STORE", "_info.txt")
+$RenamedMap = @{}
+
+Get-ChildItem -LiteralPath $SourcePlatformPath -File | Where-Object {
+    $_.Name -notin $ExcludedFiles -and $_.Extension -ne ".sh"
+} | ForEach-Object {
+    $OriginalFile = $_.Name
+    $OriginalFilePath = $_.FullName
+    $BaseName = $_.BaseName
+    $NewFileName = "{0}[{1}]{2}" -f $BaseName, $Suffix, $_.Extension
+    $LinkPath = Join-Path $TargetPlatformPath $NewFileName
+
+    Create-Symlink -TargetPath $LinkPath -SourcePath $OriginalFilePath
+    $RenamedMap[$BaseName] = $NewFileName
+
+    Clone-GamelistEntry -XmlDocs $LoadedGamelists -OriginalRomName $OriginalFile -NewRomName $NewFileName -Suffix $Suffix
+}
+
+foreach ($folderName in @("downloaded_images", "images", "manuals", "videos")) {
+    $srcFolder = Join-Path $SourcePlatformPath $folderName
+    $dstFolder = Join-Path $TargetPlatformPath $folderName
+
+    if (Test-Path -LiteralPath $srcFolder) {
+        if (-not (Test-Path -LiteralPath $dstFolder)) {
+            Log "Creating asset folder: $dstFolder"
+            New-Item -Path $dstFolder -ItemType Directory | Out-Null
         }
-    }
-
-    if (-not (Test-Path -LiteralPath $TargetPlatformPath)) {
-        Log "Creating folder: $TargetPlatformPath"
-        New-Item -Path $TargetPlatformPath -ItemType Directory | Out-Null
-    }
-
-    for ($i = 0; $i -lt $SourceGamelistFiles.Count; $i++) {
-        if ((Test-Path -LiteralPath $SourceGamelistFiles[$i]) -and (-not (Test-Path -LiteralPath $TargetGamelistFiles[$i]))) {
-            Copy-Item -LiteralPath $SourceGamelistFiles[$i] -Destination $TargetGamelistFiles[$i]
-            Log "Copied $($GamelistFiles[$i]) to: $TargetPlatformPath"
-        }
-    }
-
-    $LoadedGamelists = Load-Gamelists -Paths $TargetGamelistFiles
-    $ExcludedFiles = @("gamelist.xml", "gamelist_ARRM.xml", "gamelist_tempo_old.xml", ".DS_Store", "._.DS_STORE", "_info.txt")
-
-    $RenamedMap = @{}
-
-    Get-ChildItem -LiteralPath $SourcePlatformPath -File | Where-Object {
-        $_.Name -notin $ExcludedFiles -and $_.Extension -ne ".sh"
-    } | ForEach-Object {
-        $OriginalFile = $_.Name
-        $OriginalFilePath = $_.FullName
-        $BaseName = $_.BaseName
-        $NewFileName = "{0}[{1}]{2}" -f $BaseName, $Suffix, $_.Extension
-        $LinkPath = Join-Path $TargetPlatformPath $NewFileName
-
-        Create-Symlink -TargetPath $LinkPath -SourcePath $OriginalFilePath
-        $RenamedMap[$BaseName] = $NewFileName
-
-        Clone-GamelistEntry -XmlDocs $LoadedGamelists -OriginalRomName $OriginalFile -NewRomName $NewFileName -Suffix $Suffix
-    }
-
-    foreach ($folderName in @("downloaded_images", "images", "manuals", "videos")) {
-        $srcFolder = Join-Path $SourcePlatformPath $folderName
-        $dstFolder = Join-Path $TargetPlatformPath $folderName
-
-        if (Test-Path -LiteralPath $srcFolder) {
-            if (-not (Test-Path -LiteralPath $dstFolder)) {
-                Log "Creating asset folder: $dstFolder"
-                New-Item -Path $dstFolder -ItemType Directory | Out-Null
-            }
 
         foreach ($baseName in $RenamedMap.Keys) {
             $newBase = $RenamedMap[$baseName] -replace '\.[^.]+$', ''
-            $expectedPrefix = "$baseName"  # original ROM name before suffix
+            $expectedPrefix = "$baseName"
             $expectedPrefixLength = $expectedPrefix.Length
 
             Get-ChildItem -LiteralPath $srcFolder -File | ForEach-Object {
                 $Asset = $_
                 if (
-                    $Asset.BaseName.Length -gt $expectedPrefixLength -and
-                    $Asset.BaseName.Substring(0, $expectedPrefixLength) -eq $expectedPrefix -and
-                    ($Asset.BaseName[$expectedPrefixLength] -match '[^a-zA-Z0-9]')
+                $Asset.BaseName.Length -gt $expectedPrefixLength -and
+                        $Asset.BaseName.Substring(0, $expectedPrefixLength) -eq $expectedPrefix -and
+                        ($Asset.BaseName[$expectedPrefixLength] -match '[^a-zA-Z0-9]')
                 ) {
                     $AssetSuffix = $Asset.Name.Substring($expectedPrefixLength)
                     $TargetAssetName = "$newBase$AssetSuffix"
@@ -228,23 +245,19 @@ Get-ChildItem -LiteralPath $Drive -Directory | ForEach-Object {
                 }
             }
         }
-        }
     }
-
-    foreach ($path in $LoadedGamelists.Keys) {
-        try {
-            $LoadedGamelists[$path].Save($path)
-            Log "Saved updated gamelist: $([System.IO.Path]::GetFileName($path))"
-        } catch {
-            Log "Failed to save gamelist: $path ? $_"
-        }
-    }
-
-    $LoadedGamelists.Clear()
-    [System.GC]::Collect()
-
-    Log "Items skipped for platform: $global:PlatformSkipCount"
 }
 
-Log "Script completed. Skipped $SkipCount total files."
+foreach ($path in $LoadedGamelists.Keys) {
+    try {
+        $LoadedGamelists[$path].Save($path)
+        Log "Saved updated gamelist: $([System.IO.Path]::GetFileName($path))"
+    } catch {
+        Log "Failed to save gamelist: $path — $_"
+    }
+}
 
+$LoadedGamelists.Clear()
+[System.GC]::Collect()
+
+Log "Platform [$Platform] done. Skipped: $PlatformSkipCount files."
