@@ -1,5 +1,6 @@
 param ([string]$DriveLetter, [string]$UNCPath, [string]$Type, [string]$Suffix, [string]$Platform, [switch]$ShowSkips, [switch]$AddSuffix)
 
+$AssetFolders = @("downloaded_images", "images", "manuals", "videos")
 $LogDir = "C:\RetroBat\logs"
 if (-not (Test-Path -LiteralPath $LogDir)) {
     New-Item -Path $LogDir -ItemType Directory | Out-Null
@@ -36,7 +37,7 @@ function Load-Gamelists {
                 $doc.LoadXml($content)
                 $docs[$path] = $doc
             } catch {
-                Log "Failed to load XML file: $path — $_"
+                Log "Failed to load XML file: ${path}: $_"
             }
         }
     }
@@ -66,14 +67,42 @@ function Clone-GamelistEntry {
 function Create-Symlink {
     param ([string]$TargetPath, [string]$SourcePath)
     try {
-        if (Test-Path -LiteralPath $TargetPath) {
-            LogSkip $TargetPath
+        if (-not (Test-Path -LiteralPath $SourcePath)) {
+            Log "Source does not exist: $SourcePath"
             return
         }
-        New-Item -Path $TargetPath -ItemType SymbolicLink -Value $SourcePath -ErrorAction Stop | Out-Null
-        Log "Linked: `"$TargetPath`""
+
+        if (Test-Path -LiteralPath $TargetPath) {
+            $linkInfo = Get-Item -LiteralPath $TargetPath -Force
+
+            # Valid symlink check
+            if ($linkInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                $actualTarget = (Get-Item -LiteralPath $TargetPath -Force).Target
+                if ($actualTarget -eq $SourcePath) {
+                    LogSkip "$TargetPath (already correctly linked)"
+                    return
+                } else {
+                    Log "Replacing incorrect symlink: $TargetPath → $actualTarget"
+                    Remove-Item -LiteralPath $TargetPath -Force
+                }
+            } else {
+                Log "Skipping non-symlink item at $TargetPath"
+                return
+            }
+        }
+
+        $targetDir = Split-Path -Parent $TargetPath
+        if (-not (Test-Path -LiteralPath $targetDir)) {
+            New-Item -Path $targetDir -ItemType Directory -Force | Out-Null
+        }
+
+        $escapedTarget = '"' + $TargetPath + '"'
+        $escapedSource = '"' + $SourcePath + '"'
+
+        cmd /c "mklink $escapedTarget $escapedSource" | Out-Null
+        Log "Linked via mklink: $TargetPath → $SourcePath"
     } catch {
-        Log "Failed to link: $TargetPath — $_"
+        Log "Failed to link: ${TargetPath}: $_"
     }
 }
 
@@ -159,42 +188,96 @@ $SourceGamelistFiles = $GamelistFiles | ForEach-Object { Join-Path $SourcePlatfo
 $TargetGamelistFiles = $GamelistFiles | ForEach-Object { Join-Path $TargetPlatformPath $_ }
 
 for ($i = 0; $i -lt $SourceGamelistFiles.Count; $i++) {
-    if (Test-Path -LiteralPath $SourceGamelistFiles[$i]) {
-        try {
-            Copy-Item -LiteralPath $SourceGamelistFiles[$i] -Destination $TargetGamelistFiles[$i] -Force
-            Log "Copied $($GamelistFiles[$i]) to: $TargetPlatformPath"
-        } catch {
-            Log "Failed to copy $($GamelistFiles[$i]) — $_"
+    $src = $SourceGamelistFiles[$i]
+    $dst = $TargetGamelistFiles[$i]
+
+    if (Test-Path -LiteralPath $src) {
+        $copyNeeded = $true
+
+        if (Test-Path -LiteralPath $dst) {
+            $srcSize = (Get-Item -LiteralPath $src).Length
+            $dstSize = (Get-Item -LiteralPath $dst).Length
+
+            if ($srcSize -eq $dstSize) {
+                $copyNeeded = $false
+                Log "Skipped copy of $($GamelistFiles[$i]): same size"
+            }
+        }
+
+        if ($copyNeeded) {
+            try {
+                Copy-Item -LiteralPath $src -Destination $dst -Force
+                Log "Copied $($GamelistFiles[$i]) to: $TargetPlatformPath"
+            } catch {
+                Log "Failed to copy $($GamelistFiles[$i]): $_"
+            }
         }
     }
+}
+
+function Is-InAssetFolder {
+    param (
+        [string]$filePath,
+        [string[]]$assetPaths
+    )
+    foreach ($assetPath in $assetPaths) {
+        if ($filePath -like "$assetPath\*") {
+            return $true
+        }
+    }
+    return $false
 }
 
 $LoadedGamelists = Load-Gamelists -Paths $TargetGamelistFiles
 $ExcludedFiles = @("gamelist.xml", "gamelist_ARRM.xml", "gamelist_tempo_old.xml", ".DS_Store", "._.DS_STORE", "_info.txt")
 $RenamedMap = @{}
 
-Get-ChildItem -LiteralPath $SourcePlatformPath -File | Where-Object {
-    $_.Name -notin $ExcludedFiles -and $_.Extension -ne ".sh"
+$RenamedMap = @{}
+$AssetPaths = $AssetFolders | ForEach-Object { Join-Path $SourcePlatformPath $_ }
+Get-ChildItem -LiteralPath $SourcePlatformPath -Recurse -File | Where-Object {
+    $_.Name -notin $ExcludedFiles -and
+            $_.Extension -ne ".sh" -and
+            ($_.FullName.Substring($SourcePlatformPath.Length).TrimStart('\') -notmatch '^(backup\\|backup\/)') -and
+            -not (Is-InAssetFolder -filePath $_.FullName -assetPaths $AssetPaths)
 } | ForEach-Object {
-    $OriginalFile = $_.Name
     $OriginalFilePath = $_.FullName
+    $RelativePath = $OriginalFilePath.Substring($SourcePlatformPath.Length).TrimStart('\')
+    $SourceIsInRoot = ($RelativePath -notmatch '\\')
+
     $BaseName = $_.BaseName
-    $NewFileName = if ($AddSuffix) {
-        "{0}[{1}]{2}" -f $BaseName, $Suffix, $_.Extension
+    $Extension = $_.Extension
+
+    $NewFileName = if ($AddSuffix -and $SourceIsInRoot) {
+        "{0}[{1}]{2}" -f $BaseName, $Suffix, $Extension
     } else {
         $_.Name
     }
-    $LinkPath = Join-Path $TargetPlatformPath $NewFileName
 
-    Create-Symlink -TargetPath $LinkPath -SourcePath $OriginalFilePath
-    $RenamedMap[$BaseName] = $NewFileName
-    if ($AddSuffix) {
-        Clone-GamelistEntry -XmlDocs $LoadedGamelists -OriginalRomName $OriginalFile -NewRomName $NewFileName -Suffix $Suffix
+    $RelativeTargetPath = if ($SourceIsInRoot) {
+        $NewFileName
+    } else {
+        Join-Path (Split-Path $RelativePath -Parent) $NewFileName
+    }
+
+    $TargetFullPath = Join-Path $TargetPlatformPath $RelativeTargetPath
+    $TargetDir = Split-Path $TargetFullPath
+
+    if (-not (Test-Path -LiteralPath $TargetDir)) {
+        New-Item -Path $TargetDir -ItemType Directory -Force | Out-Null
+        Log "Created subfolder: $TargetDir"
+    }
+
+    Create-Symlink -TargetPath $TargetFullPath -SourcePath $OriginalFilePath
+
+    if ($SourceIsInRoot) {
+        $RenamedMap[$BaseName] = $NewFileName
+        if ($AddSuffix) {
+            Clone-GamelistEntry -XmlDocs $LoadedGamelists -OriginalRomName $_.Name -NewRomName $NewFileName -Suffix $Suffix
+        }
     }
 }
 
 # ASSET LINKING BLOCK
-$AssetFolders = @("downloaded_images", "images", "manuals", "videos")
 foreach ($folderName in $AssetFolders) {
     $srcFolder = Join-Path $SourcePlatformPath $folderName
     $dstFolder = Join-Path $TargetPlatformPath $folderName
@@ -205,7 +288,7 @@ foreach ($folderName in $AssetFolders) {
                 Remove-Item -LiteralPath $dstFolder -Recurse -Force
                 Log "Removed existing folder: $dstFolder"
             } catch {
-                Log "Failed to remove existing folder: $dstFolder — $_"
+                Log "Failed to remove existing folder: ${dstFolder}: $_"
                 continue
             }
         }
@@ -214,7 +297,7 @@ foreach ($folderName in $AssetFolders) {
             New-Item -Path $dstFolder -ItemType SymbolicLink -Value $srcFolder -ErrorAction Stop | Out-Null
             Log "Linked asset folder: $dstFolder → $srcFolder"
         } catch {
-            Log "Failed to link asset folder: $dstFolder — $_"
+            Log "Failed to link asset folder: ${dstFolder}: $_"
         }
     }
 }
@@ -225,7 +308,7 @@ if ($AddSuffix) {
             $LoadedGamelists[$path].Save($path)
             Log "Saved updated gamelist: $([System.IO.Path]::GetFileName($path) )"
         } catch {
-            Log "Failed to save gamelist: $path — $_"
+            Log "Failed to save gamelist: ${path}: $_"
         }
     }
 }
