@@ -47,8 +47,6 @@ function Clone-GamelistEntry {
     param ([hashtable]$XmlDocs, [string]$OriginalRomName, [string]$NewRomName, [string]$Suffix)
     $originalPath = "./$OriginalRomName"
     $newPath = "./$NewRomName"
-    $targetBase = $newPath -replace '^\.\/', '' -replace '\.[^\.]+$', ''
-    $originalBase = $targetBase -replace "\[$Suffix\]$", ''
 
     foreach ($pair in $XmlDocs.GetEnumerator()) {
         $path = $pair.Key
@@ -58,21 +56,9 @@ function Clone-GamelistEntry {
         if ($matchingGame) {
             $clone = $matchingGame.Clone()
             $clone.path = $newPath
-            if ($clone.name) {
-                $clone.name = "$( $clone.name )[$Suffix]"
-            }
-            if ($clone.sortname) {
-                $clone.sortname = "$( $clone.sortname )[$Suffix]"
-            }
-
-            foreach ($tag in @("image", "video", "marquee", "cartridge", "boxart", "wheel", "mix", "screenshot")) {
-                if ($clone.$tag) {
-                    $clone.$tag = $clone.$tag -replace [regex]::Escape($originalBase), $targetBase
-                }
-            }
 
             $xml.gameList.AppendChild($xml.ImportNode($clone, $true)) | Out-Null
-            Log "Cloned entry in $([System.IO.Path]::GetFileName($path) ) for: $NewRomName"
+            Log "Cloned entry in $([System.IO.Path]::GetFileName($path)) with new path: $NewRomName"
         }
     }
 }
@@ -173,9 +159,13 @@ $SourceGamelistFiles = $GamelistFiles | ForEach-Object { Join-Path $SourcePlatfo
 $TargetGamelistFiles = $GamelistFiles | ForEach-Object { Join-Path $TargetPlatformPath $_ }
 
 for ($i = 0; $i -lt $SourceGamelistFiles.Count; $i++) {
-    if ((Test-Path -LiteralPath $SourceGamelistFiles[$i]) -and (-not (Test-Path -LiteralPath $TargetGamelistFiles[$i]))) {
-        Copy-Item -LiteralPath $SourceGamelistFiles[$i] -Destination $TargetGamelistFiles[$i]
-        Log "Copied $($GamelistFiles[$i]) to: $TargetPlatformPath"
+    if (Test-Path -LiteralPath $SourceGamelistFiles[$i]) {
+        try {
+            Copy-Item -LiteralPath $SourceGamelistFiles[$i] -Destination $TargetGamelistFiles[$i] -Force
+            Log "Copied $($GamelistFiles[$i]) to: $TargetPlatformPath"
+        } catch {
+            Log "Failed to copy $($GamelistFiles[$i]) — $_"
+        }
     }
 }
 
@@ -210,37 +200,21 @@ foreach ($folderName in $AssetFolders) {
     $dstFolder = Join-Path $TargetPlatformPath $folderName
 
     if (Test-Path -LiteralPath $srcFolder) {
-        if (-not (Test-Path -LiteralPath $dstFolder)) {
-            Log "Creating asset folder: $dstFolder"
-            New-Item -Path $dstFolder -ItemType Directory | Out-Null
+        if (Test-Path -LiteralPath $dstFolder) {
+            try {
+                Remove-Item -LiteralPath $dstFolder -Recurse -Force
+                Log "Removed existing folder: $dstFolder"
+            } catch {
+                Log "Failed to remove existing folder: $dstFolder — $_"
+                continue
+            }
         }
 
-        if ($AddSuffix) {
-            foreach ($baseName in $RenamedMap.Keys) {
-                $newBase = $RenamedMap[$baseName] -replace '\.[^.]+$', ''
-                $expectedPrefix = "$baseName"
-                $expectedPrefixLength = $expectedPrefix.Length
-
-                Get-ChildItem -LiteralPath $srcFolder -File | ForEach-Object {
-                    $Asset = $_
-                    if ($Asset.BaseName.Length -gt $expectedPrefixLength -and $Asset.BaseName.Substring(0, $expectedPrefixLength) -eq $expectedPrefix -and ($Asset.BaseName[$expectedPrefixLength] -match '[^a-zA-Z0-9]')) {
-                        $AssetSuffix = $Asset.Name.Substring($expectedPrefixLength)
-                        $TargetAssetName = "$newBase$AssetSuffix"
-                        $dstLink = Join-Path $dstFolder $TargetAssetName
-                        Create-Symlink -TargetPath $dstLink -SourcePath $Asset.FullName
-                    }
-                }
-            }
-        } else {
-            Get-ChildItem -Path $srcFolder -Recurse -File | ForEach-Object {
-                $relativePath = $_.FullName.Substring($srcFolder.Length).TrimStart('\\')
-                $targetPath = Join-Path $dstFolder $relativePath
-                $targetDir = Split-Path $targetPath
-                if (-not (Test-Path $targetDir)) {
-                    New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-                }
-                Create-Symlink -TargetPath $targetPath -SourcePath $_.FullName
-            }
+        try {
+            New-Item -Path $dstFolder -ItemType SymbolicLink -Value $srcFolder -ErrorAction Stop | Out-Null
+            Log "Linked asset folder: $dstFolder → $srcFolder"
+        } catch {
+            Log "Failed to link asset folder: $dstFolder — $_"
         }
     }
 }
